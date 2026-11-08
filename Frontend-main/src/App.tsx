@@ -8,8 +8,24 @@ import NetworkGraph from './components/NetworkGraph';
 import LedgerTable from './components/LedgerTable';
 import Dossier from './components/Dossier';
 import PanVerify from './components/PanVerify';
-import type { MuleNode, GraphData, DetectionResult } from './types';
+import type { MuleNode } from './types';
 import { Radar, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
+
+const mapAccountToMule = (acc: any): MuleNode => ({
+  id: acc.account_id || acc.id,
+  name: acc.account_id || acc.name || acc.id,
+  riskScore: typeof acc.suspicion_score === 'number' ? acc.suspicion_score : (acc.riskScore || 0),
+  riskLevel: acc.risk_level || acc.riskLevel || 'LOW',
+  type: acc.type || 'mule',
+  flaggedPatterns: acc.detected_patterns || acc.flaggedPatterns || [],
+  reasons: acc.reasons || [],
+  inAmount: acc.in_amount ?? acc.inAmount,
+  outAmount: acc.out_amount ?? acc.outAmount,
+  passThroughRatio: acc.pass_through_ratio ?? acc.passThroughRatio,
+  uniqueSenders: acc.unique_senders ?? acc.uniqueSenders,
+  uniqueReceivers: acc.unique_receivers ?? acc.uniqueReceivers,
+  txCount: acc.tx_count ?? acc.txCount,
+});
 
 function App() {
   // Vanta.js background — stays mounted behind both states
@@ -27,15 +43,26 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [activeSection, setActiveSection] = useState('dashboard');
   const [selectedNode, setSelectedNode] = useState<MuleNode | null>(null);
-  const [mules, setMules] = useState<MuleNode[]>([]);
-  const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
-  const [summary, setSummary] = useState<DetectionResult['summary'] | null>(null);
   const [responseData, setResponseData] = useState<any>(null);
+
+  // Data Preparation
+  const summary = responseData?.summary || null;
+  const graphData = responseData?.graph || { nodes: [], links: [] };
+  
+  // Map backend response format to frontend MuleNode schema.
+  // /detect returns `mules`, while /analyze returns `suspicious_accounts`.
+  const rawSuspiciousAccounts =
+    responseData?.suspicious_accounts ||
+    responseData?.detailedAnalysis?.suspicious_accounts ||
+    responseData?.mules ||
+    [];
+  const mules = rawSuspiciousAccounts.map(mapAccountToMule);
 
   // Graph container sizing
   const graphContainerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<ResizeObserver | null>(null);
   const [graphDimensions, setGraphDimensions] = useState({ width: 600, height: 400 });
+  const graphComponentRef = useRef<any>(null);
 
   useEffect(() => {
     if (!hasUploaded) return;
@@ -69,17 +96,12 @@ function App() {
   // Handle upload response — triggers the landing → dashboard transition
   const handleUploadComplete = useCallback((data: any) => {
     setResponseData(data);
-    if (data.graph) {
-      setGraphData(data.graph);
-    }
-    if (data.mules) {
-      setMules(data.mules);
-    }
-    if (data.summary) {
-      setSummary(data.summary);
-    }
-    if (data.mules && data.mules.length > 0) {
-      setSelectedNode(data.mules[0]);
+    const firstAccount =
+      data.suspicious_accounts?.[0] ||
+      data.detailedAnalysis?.suspicious_accounts?.[0] ||
+      data.mules?.[0];
+    if (firstAccount) {
+      setSelectedNode(mapAccountToMule(firstAccount));
     }
     // Trigger transition
     setHasUploaded(true);
@@ -172,13 +194,19 @@ function App() {
                           </h3>
                         </div>
                         <div className="flex items-center gap-1 pointer-events-auto">
-                          <button className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
+                          <button 
+                            onClick={() => graphComponentRef.current?.zoomIn()}
+                            className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
                             <ZoomIn className="w-3.5 h-3.5" />
                           </button>
-                          <button className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
+                          <button 
+                            onClick={() => graphComponentRef.current?.zoomOut()}
+                            className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
                             <ZoomOut className="w-3.5 h-3.5" />
                           </button>
-                          <button className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
+                          <button 
+                            onClick={() => graphComponentRef.current?.fitToScreen()}
+                            className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-gray-200 transition-colors">
                             <Maximize2 className="w-3.5 h-3.5" />
                           </button>
                         </div>
@@ -188,6 +216,7 @@ function App() {
                       <div ref={graphContainerRef} className="w-full h-full">
                         {graphData.nodes.length > 0 ? (
                           <NetworkGraph
+                            ref={graphComponentRef}
                             graphData={graphData}
                             onNodeClick={handleNodeClick}
                             width={graphDimensions.width}

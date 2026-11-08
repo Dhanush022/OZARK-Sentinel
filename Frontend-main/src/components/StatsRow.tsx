@@ -1,19 +1,38 @@
 import { TrendingUp, Users, AlertTriangle, Waypoints } from 'lucide-react';
 
 interface StatsRowProps {
-  summary: {
-    totalTransactions: number;
-    flaggedAccounts: number;
-    averageRiskScore: number;
-    detectedCycles: number;
-  } | null;
+  summary: any | null;
 }
 
 export default function StatsRow({ summary }: StatsRowProps) {
+  // Support both the wrapped /detect summary (camelCase) and the raw
+  // scalable-analyzer summary (snake_case).
+  const totalTransactions =
+    summary?.total_transactions ?? summary?.totalTransactions;
+  const flaggedAccounts =
+    summary?.suspicious_accounts_flagged ??
+    summary?.suspicious_accounts_found ??
+    summary?.flaggedAccounts;
+  const rawAverageRisk =
+    summary?.risk_score_distribution?.mean ?? summary?.averageRiskScore;
+  const averageRiskScore =
+    typeof rawAverageRisk === 'number'
+      ? rawAverageRisk <= 1
+        ? rawAverageRisk * 100
+        : rawAverageRisk
+      : null;
+  const detectedCycles =
+    summary?.fraud_rings_detected ??
+    summary?.fraud_rings_found ??
+    summary?.detectedCycles;
+
   const stats = [
     {
       label: 'Transactions Scanned',
-      value: summary ? summary.totalTransactions.toLocaleString() : '—',
+      value:
+        totalTransactions != null
+          ? Number(totalTransactions).toLocaleString()
+          : '—',
       icon: TrendingUp,
       color: 'text-algo-teal',
       bgColor: 'bg-algo-teal/10',
@@ -21,7 +40,7 @@ export default function StatsRow({ summary }: StatsRowProps) {
     },
     {
       label: 'Flagged Accounts',
-      value: summary ? summary.flaggedAccounts.toString() : '—',
+      value: flaggedAccounts != null ? String(flaggedAccounts) : '—',
       icon: Users,
       color: 'text-algo-red',
       bgColor: 'bg-red-500/10',
@@ -29,7 +48,8 @@ export default function StatsRow({ summary }: StatsRowProps) {
     },
     {
       label: 'Avg Risk Score',
-      value: summary ? `${summary.averageRiskScore}%` : '—',
+      value:
+        averageRiskScore != null ? `${Math.round(averageRiskScore)}%` : '—',
       icon: AlertTriangle,
       color: 'text-algo-amber',
       bgColor: 'bg-amber-500/10',
@@ -37,7 +57,7 @@ export default function StatsRow({ summary }: StatsRowProps) {
     },
     {
       label: 'Detected Cycles',
-      value: summary ? summary.detectedCycles.toString() : '—',
+      value: detectedCycles != null ? String(detectedCycles) : '—',
       icon: Waypoints,
       color: 'text-indigo-400',
       bgColor: 'bg-indigo-500/10',

@@ -2,8 +2,16 @@ export interface MuleNode {
   id: string;
   name: string;
   riskScore: number;
-  type: 'mule' | 'shell' | 'normal';
+  riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
+  type: 'mule' | 'shell' | 'normal' | 'ring';
   flaggedPatterns: string[];
+  reasons?: string[];
+  inAmount?: number;
+  outAmount?: number;
+  passThroughRatio?: number;
+  uniqueSenders?: number;
+  uniqueReceivers?: number;
+  txCount?: number;
   accountAge?: string;
   totalVolume?: number;
   linkedAccounts?: number;

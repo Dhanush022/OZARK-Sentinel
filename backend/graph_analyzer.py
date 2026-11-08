@@ -18,154 +18,61 @@ TRUSTED_ACCOUNTS = {
 
 def analyze_transactions(csv_data: bytes) -> Dict[str, Any]:
     """
-    Analyze transaction CSV for money mule patterns using graph analysis
-    
-    Detections:
-    1. Circular Routing (3-5 node cycles)
-    2. Smurfing (fan-in/fan-out patterns)
-    3. Shell Networks (dormant intermediary chains)
-    
-    Args:
-        csv_data: Raw CSV file bytes
-        
-    Returns:
-        Dictionary containing:
-        - suspicious_accounts: List of flagged account objects
-        - fraud_rings: List of fraud ring objects
-        - summary: Statistics and metadata
+    Analyze transaction CSV using scalable two-stage pipeline:
+    Stage 1: Out-of-core DuckDB behavioral feature extraction & candidate selection.
+    Stage 2: Bounded neighborhood graph retrieval (max 1000 nodes) & NetworkX analytics.
     """
-    # Start timing
-    start_time = time.time()
-    
-    # Parse CSV
-    try:
-        df = pd.read_csv(StringIO(csv_data.decode('utf-8')))
-    except Exception as e:
-        raise ValueError(f"Failed to parse CSV: {str(e)}")
-    
-    # Validate required columns
-    required_columns = ['sender_id', 'receiver_id', 'amount']
-    if not all(col in df.columns for col in required_columns):
-        raise ValueError(f"CSV must contain columns: {required_columns}")
-    
-    # Build directed graph
-    G = nx.DiGraph()
-    
-    for _, row in df.iterrows():
-        from_acc = str(row['sender_id'])
-        to_acc = str(row['receiver_id'])
-        amount = float(row['amount'])
-        
-        # Add edge with transaction metadata
-        if G.has_edge(from_acc, to_acc):
-            # Aggregate multiple transactions
-            G[from_acc][to_acc]['amount'] += amount
-            G[from_acc][to_acc]['count'] += 1
-        else:
-            G.add_edge(from_acc, to_acc, amount=amount, count=1)
-    
-    # DETECTION 1: Cycle Detection (Money Mule Rings)
-    mule_rings = detect_mule_rings(G)
-    
-    # DETECTION 2: Smurfing Detection
-    smurfing_accounts = detect_smurfing(G)
-    
-    # DETECTION 3: Layered Networks
-    layered_chains = detect_shell_networks(G)
-    
-    # DETECTION 4: High Velocity Accounts
-    high_velocity_accounts = detect_high_velocity(G)
-    
-    # Track patterns for each account
-    account_patterns = track_patterns_per_account(
-        G, mule_rings, smurfing_accounts, layered_chains, high_velocity_accounts
-    )
-    
-    # Calculate risk scores for all suspicious accounts
-    all_suspicious = set()
-    for ring in mule_rings:
-        all_suspicious.update(ring)
-    all_suspicious.update(smurfing_accounts)
-    for chain in layered_chains:
-        all_suspicious.update(chain)
-    all_suspicious.update(high_velocity_accounts)
-    
-    risk_scores = {}
-    for account in all_suspicious:
-        score = calculate_risk_score(G, account, mule_rings, smurfing_accounts, layered_chains)
-        risk_scores[account] = score
-    
-    # APPLY FALSE POSITIVE CONTROLS
-    # 1. Multi-pattern confirmation: Flag only if ≥2 patterns
-    # 2. Risk threshold: Flag only if risk ≥60
-    # 3. Trusted accounts: Reduce risk for known legitimate accounts
-    suspicious_accounts = apply_false_positive_controls(
-        all_suspicious, account_patterns, risk_scores, G
-    )
-    
-    # GENERATE FRAUD RINGS
-    # Create structured ring objects with IDs
-    fraud_rings, account_to_ring = generate_fraud_rings(
-        mule_rings, smurfing_accounts, layered_chains, 
-        suspicious_accounts, risk_scores
-    )
-    
-    # Prepare graph data for visualization (only suspicious accounts and their connections)
-    graph_data = prepare_graph_visualization(G, suspicious_accounts)
-    
-    # Filter risk_scores to only include final flagged accounts
-    filtered_risk_scores = {acc: risk_scores[acc] for acc in suspicious_accounts if acc in risk_scores}
-    # End timing
-    processing_time = round(time.time() - start_time, 2)
-    
-    # TRANSFORM TO REQUIRED OUTPUT FORMAT
-    output = transform_to_required_format(
-        suspicious_accounts=suspicious_accounts,
-        account_patterns=account_patterns,
-        risk_scores=filtered_risk_scores,
-        account_to_ring=account_to_ring,
-        fraud_rings=fraud_rings,
-        total_accounts=G.number_of_nodes(),
-        total_transactions=G.number_of_edges(),
-        processing_time=processing_time
-    )
-    
-    # Return both output and graph for visualization
-    return output, G
+    from scalable_analyzer import analyze_transactions_scalable_bytes
+    return analyze_transactions_scalable_bytes(csv_data)
+
+
 
 
 def detect_mule_rings(G: nx.DiGraph) -> List[List[str]]:
     """
     Detect money mule rings (circular routing patterns)
-    Look for cycles of length 3-5 nodes
+    Look for cycles of length 3-5 nodes (capped at 500 rings for safety)
     """
     try:
-        all_cycles = list(nx.simple_cycles(G))
-        # Filter for typical mule ring sizes (3-5 participants)
-        mule_rings = [cycle for cycle in all_cycles if 3 <= len(cycle) <= 5]
+        mule_rings = []
+        for cycle in nx.simple_cycles(G):
+            if 3 <= len(cycle) <= 5:
+                mule_rings.append(cycle)
+                if len(mule_rings) >= 500:
+                    break
         return mule_rings
     except:
         return []
 
 
+def safe_degree(G: nx.DiGraph, node: str) -> int:
+    return G.degree[node] if G.has_node(node) else 0
+
+def safe_in_degree(G: nx.DiGraph, node: str) -> int:
+    return G.in_degree[node] if G.has_node(node) else 0
+
+def safe_out_degree(G: nx.DiGraph, node: str) -> int:
+    return G.out_degree[node] if G.has_node(node) else 0
+
+
 def detect_smurfing(G: nx.DiGraph) -> List[str]:
     """
     Detect smurfing patterns:
-    1. FAN-IN: Many accounts (≥10) send to same receiver
-    2. FAN-OUT: One account sends to many receivers (≥10)
+    1. FAN-IN: Many accounts (>=10) send to same receiver
+    2. FAN-OUT: One account sends to many receivers (>=10)
     """
     smurfing_accounts = []
     
     for node in G.nodes():
-        in_degree = G.in_degree(node)
-        out_degree = G.out_degree(node)
+        in_deg = safe_in_degree(G, node)
+        out_deg = safe_out_degree(G, node)
         
         # FAN-IN Pattern: 10+ incoming, few outgoing
-        if in_degree >= 10 and out_degree <= 2:
+        if in_deg >= 10 and out_deg <= 2:
             smurfing_accounts.append(node)
         
         # FAN-OUT Pattern: Few incoming, 10+ outgoing
-        elif out_degree >= 10 and in_degree <= 2:
+        elif out_deg >= 10 and in_deg <= 2:
             smurfing_accounts.append(node)
     
     return smurfing_accounts
@@ -174,52 +81,37 @@ def detect_smurfing(G: nx.DiGraph) -> List[str]:
 def detect_shell_networks(G: nx.DiGraph) -> List[List[str]]:
     """
     Detect layered mule networks (multi-hop chains with dormant intermediaries)
-    
-    Conditions:
-    - Path length ≥4 (at least 4 accounts in chain)
-    - Intermediate accounts have ≤3 transactions total
-    - Max depth 4 to prevent performance issues
-    
-    Pattern: A → B → C → D where B, C are dormant mule accounts
     """
     layered_chains = []
     
     if G.number_of_nodes() == 0:
         return layered_chains
     
-    # Get all nodes sorted by degree (potential start nodes have higher activity)
-    nodes_by_degree = sorted(G.nodes(), key=lambda n: G.degree(n), reverse=True)
-    
-    # Limit search to top nodes to avoid performance issues
+    # Get all nodes sorted by degree
+    nodes_by_degree = sorted(G.nodes(), key=lambda n: safe_degree(G, n), reverse=True)
     search_nodes = nodes_by_degree[:min(50, len(nodes_by_degree))]
     
     processed_chains = set()
     
     for source in search_nodes:
-        # Only search from nodes with outgoing connections
-        if G.out_degree(source) == 0:
+        if safe_out_degree(G, source) == 0:
             continue
             
-        # Find all paths of length 4 from this source (max depth 4)
         try:
             for target in G.nodes():
                 if source == target:
                     continue
                     
-                # Use cutoff=4 to limit path length and improve performance
                 try:
                     paths = list(nx.all_simple_paths(G, source, target, cutoff=4))
                     
                     for path in paths:
-                        # Require path length ≥4 (4 or more accounts)
                         if len(path) < 4:
                             continue
                         
-                        # Check if intermediate nodes are dormant (≤3 transactions)
-                        intermediates = path[1:-1]  # Exclude source and target
+                        intermediates = path[1:-1]
                         
-                        if all(G.degree(node) <= 3 for node in intermediates):
-                            # Valid layered network found
+                        if all(safe_degree(G, node) <= 3 for node in intermediates):
                             path_tuple = tuple(path)
                             if path_tuple not in processed_chains:
                                 layered_chains.append(path)
@@ -239,43 +131,34 @@ def calculate_risk_score(
     account: str,
     mule_rings: List[List[str]],
     smurfing_accounts: List[str],
-    layered_chains: List[List[str]]
+    layered_chains: List[List[str]],
+    centrality_scores: Dict[str, float] = None
 ) -> int:
     """
     Calculate risk score for an account (0-100 scale)
-    
-    Scoring:
-    - In mule ring (cycle): +40 points
-    - Smurfing pattern (fan-in/fan-out): +25 points (changed from +30)
-    - In layered network: +35 points
-    - High velocity (≥8 transactions): +10 points
-    - High centrality: +10 points
     """
     score = 0
     
     # Check if in mule ring
     if any(account in ring for ring in mule_rings):
-        score += 40
+        score += 65
     
     # Check if smurfing account
     if account in smurfing_accounts:
-        score += 25
+        score += 35
     
     # Check if in layered network
     if any(account in chain for chain in layered_chains):
         score += 35
     
-    # Check high velocity
-    if G.degree(account) >= 8:
-        score += 10
+    # Check high velocity safely
+    if safe_degree(G, account) >= 8:
+        score += 20
     
     # Add centrality score (high traffic node)
-    if G.number_of_nodes() > 0:
-        try:
-            centrality = nx.betweenness_centrality(G).get(account, 0)
-            score += int(centrality * 10)
-        except:
-            pass
+    if centrality_scores:
+        centrality = centrality_scores.get(account, 0)
+        score += int(centrality * 20)
     
     # Cap at 100
     return min(score, 100)
@@ -283,17 +166,12 @@ def calculate_risk_score(
 
 def detect_high_velocity(G: nx.DiGraph) -> List[str]:
     """
-    Detect high velocity accounts (≥8 transactions)
-    Pattern: "high_velocity"
-    Risk: +10 points
+    Detect high velocity accounts (>=8 transactions)
     """
     high_velocity = []
     
     for node in G.nodes():
-        # Count total transactions (in + out)
-        transaction_count = G.degree(node)
-        
-        if transaction_count >= 8:
+        if safe_degree(G, node) >= 8:
             high_velocity.append(node)
     
     return high_velocity
@@ -308,7 +186,6 @@ def track_patterns_per_account(
 ) -> Dict[str, List[str]]:
     """
     Track which patterns each account exhibits
-    Returns dict: {account_id: [pattern1, pattern2, ...]}
     """
     account_patterns = {}
     
@@ -319,20 +196,20 @@ def track_patterns_per_account(
         for account in ring:
             if account not in account_patterns:
                 account_patterns[account] = []
-            account_patterns[account].append(pattern_name)
+            if pattern_name not in account_patterns[account]:
+                account_patterns[account].append(pattern_name)
     
-    # Track smurfing patterns (need to differentiate fan-in vs fan-out)
+    # Track smurfing patterns
     for account in smurfing_accounts:
         if account not in account_patterns:
             account_patterns[account] = []
         
-        # Check if it's fan-in or fan-out
-        in_degree = G.in_degree(account)
-        out_degree = G.out_degree(account)
+        in_deg = safe_in_degree(G, account)
+        out_deg = safe_out_degree(G, account)
         
-        if in_degree >= 10:
+        if in_deg >= 10 and "fan_in" not in account_patterns[account]:
             account_patterns[account].append("fan_in")
-        if out_degree >= 10:
+        if out_deg >= 10 and "fan_out" not in account_patterns[account]:
             account_patterns[account].append("fan_out")
     
     # Track layered network patterns
@@ -340,15 +217,18 @@ def track_patterns_per_account(
         for account in chain:
             if account not in account_patterns:
                 account_patterns[account] = []
-            account_patterns[account].append("layered_network")
+            if "layered_network" not in account_patterns[account]:
+                account_patterns[account].append("layered_network")
     
     # Track high velocity
     for account in high_velocity_accounts:
         if account not in account_patterns:
             account_patterns[account] = []
-        account_patterns[account].append("high_velocity")
+        if "high_velocity" not in account_patterns[account]:
+            account_patterns[account].append("high_velocity")
     
     return account_patterns
+
 
 
 def apply_false_positive_controls(
@@ -361,43 +241,28 @@ def apply_false_positive_controls(
     Apply false positive controls to reduce incorrect flagging
     
     Rules:
-    1. Multi-pattern confirmation: Flag only if ≥2 patterns
-    2. Risk threshold: Flag only if risk ≥60
-    3. Trusted accounts: Whitelist known legitimate accounts
-    4. Merchant filtering: Ignore high fan-in without cycles/velocity
+    1. Mule ring cycles & high-risk multi-patterns are flagged
+    2. Require risk >= 60 OR explicit mule cycle participation
+    3. Whitelist trusted accounts
     """
     filtered_suspicious = set()
     
     for account in all_suspicious:
-        # Rule 3: Skip trusted accounts
+        # Skip trusted accounts
         if account in TRUSTED_ACCOUNTS:
             continue
         
-        # Get account's patterns
         patterns = account_patterns.get(account, [])
+        score = risk_scores.get(account, 0)
         
-        # Rule 1: Require ≥2 patterns (multi-pattern confirmation)
-        if len(patterns) < 2:
-            # Exception: If single pattern has very high risk (≥85), still flag
-            if risk_scores.get(account, 0) < 85:
-                continue
+        has_cycle = any("cycle" in p for p in patterns)
         
-        # Rule 2: Require risk ≥60
-        if risk_scores.get(account, 0) < 60:
-            continue
-        
-        # Rule 4: Merchant behavior filtering
-        # If only has fan_in and nothing else, likely a merchant
-        if patterns == ["fan_in"]:
-            # Check if it's actually a cycle or high velocity
-            has_cycle = any(account in ring for ring in [])  # Will be checked properly
-            if not has_cycle and G.degree(account) < 20:
-                continue
-        
-        # Passed all filters - mark as suspicious
-        filtered_suspicious.add(account)
-    
+        # Exception: Cycle ring membership or high risk score (>= 60) or >= 2 patterns
+        if has_cycle or score >= 60 or len(patterns) >= 2:
+            filtered_suspicious.add(account)
+            
     return filtered_suspicious
+
 
 
 def generate_fraud_rings(
@@ -529,7 +394,8 @@ def transform_to_required_format(
     fraud_rings: List[Dict[str, Any]],
     total_accounts: int,
     total_transactions: int,
-    processing_time: float
+    processing_time: float,
+    graph_data: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
     Transform internal format to required JSON output format
@@ -573,45 +439,205 @@ def transform_to_required_format(
     }
     
     # Return in required format
-    return {
+    result = {
         "suspicious_accounts": suspicious_accounts_list,
+        "mules": suspicious_accounts_list,
         "fraud_rings": fraud_rings,
         "summary": summary
     }
+    if graph_data:
+        result["graph"] = graph_data
+    return result
 
 
-def prepare_graph_visualization(G: nx.DiGraph, suspicious_accounts: Set[str]) -> Dict[str, Any]:
+def prepare_graph_visualization(
+    G: nx.DiGraph, 
+    suspicious_accounts: Set[str],
+    account_to_ring: Dict[str, str],
+    risk_scores: Dict[str, int],
+    account_patterns: Dict[str, List[str]]
+) -> Dict[str, Any]:
     """
     Prepare graph data for React Flow visualization
-    Only includes suspicious accounts and their direct connections
+    Includes all accounts and their connections with visual metadata
     """
     nodes = []
     edges = []
     
-    # Only include suspicious accounts as nodes
-    for node in suspicious_accounts:
-        if node in G.nodes():
-            nodes.append({
-                "id": node,
-                "label": node,
-                "is_flagged": True,
-                "transaction_count": G.degree(node)
-            })
-    
-    # Only include edges between suspicious accounts
-    edge_id = 0
+    for node in G.nodes():
+        node_type = "normal"
+        if node in suspicious_accounts:
+            patterns = account_patterns.get(node, [])
+            if any("cycle" in p or "layered" in p for p in patterns):
+                node_type = "ring"
+            else:
+                node_type = "mule"
+                
+        # Calculate total volume for the node
+        total_volume = 0
+        for u, v, data in G.in_edges(node, data=True):
+            total_volume += data.get('amount', 0)
+        for u, v, data in G.out_edges(node, data=True):
+            total_volume += data.get('amount', 0)
+            
+        nodes.append({
+            "id": node,
+            "name": node,
+            "type": node_type,
+            "riskScore": risk_scores.get(node, 0),
+            "flaggedPatterns": account_patterns.get(node, []),
+            "totalVolume": total_volume,
+            "linkedAccounts": safe_degree(G, node)
+        })
+        
     for u, v, data in G.edges(data=True):
-        if u in suspicious_accounts and v in suspicious_accounts:
-            edges.append({
-                "id": f"e{edge_id}",
-                "source": u,
-                "target": v,
-                "amount": data['amount'],
-                "count": data.get('count', 1)
-            })
-            edge_id += 1
-    
+        # Ring connection is true if both source and target are in the same ring
+        ring_u = account_to_ring.get(u)
+        ring_v = account_to_ring.get(v)
+        is_ring_connection = False
+        if ring_u and ring_v and ring_u == ring_v and ring_u != "UNASSIGNED":
+            is_ring_connection = True
+            
+        edges.append({
+            "source": u,
+            "target": v,
+            "value": data.get('amount', 0),
+            "isRingConnection": is_ring_connection
+        })
+        
     return {
         "nodes": nodes,
-        "edges": edges
+        "links": edges
+    }
+
+
+def map_columns(columns: List[str]) -> Dict[str, str]:
+    mapping = {}
+    cols_lower = [c.lower() for c in columns]
+    
+    # 1. Sender Mapping
+    for c in ['sender_id', 'sender', 'from_account', 'from', 'account']:
+        if c in cols_lower:
+            idx = cols_lower.index(c)
+            mapping['sender_id'] = columns[idx]
+            break
+            
+    # Special check for 'account' and 'account.1' (Kaggle dataset specific)
+    if 'account' in cols_lower and 'account.1' in cols_lower:
+        mapping['sender_id'] = columns[cols_lower.index('account')]
+        mapping['receiver_id'] = columns[cols_lower.index('account.1')]
+    
+    # 2. Receiver Mapping if not set by special check
+    if 'receiver_id' not in mapping:
+        for c in ['receiver_id', 'receiver', 'to_account', 'to']:
+            if c in cols_lower:
+                idx = cols_lower.index(c)
+                mapping['receiver_id'] = columns[idx]
+                break
+                
+    # 3. Amount Mapping
+    for c in ['amount', 'amount paid', 'amount received', 'value', 'amt']:
+        if c in cols_lower:
+            idx = cols_lower.index(c)
+            mapping['amount'] = columns[idx]
+            break
+            
+    # 4. Laundering Mapping
+    for c in ['is laundering', 'is_laundering', 'laundering', 'is_mule', 'label']:
+        if c in cols_lower:
+            idx = cols_lower.index(c)
+            mapping['is_laundering'] = columns[idx]
+            break
+            
+    return mapping
+
+
+def analyze_large_local_csv(
+    file_path: str,
+    sample_limit: int = 100000,
+    downsample_rate: float = 0.001,
+    only_laundering: bool = True
+) -> Tuple[Dict[str, Any], nx.DiGraph]:
+    """
+    Read large CSV in chunks using DuckDB out-of-core Stage 1 feature extraction
+    and Stage 2 bounded neighborhood graph analysis (max 1000 nodes).
+    Prevents memory overflow on large multi-gigabyte datasets.
+    """
+    from scalable_analyzer import analyze_transactions_scalable
+    return analyze_transactions_scalable(file_path=file_path)
+
+
+
+def prepare_capped_graph_visualization(
+    G: nx.DiGraph, 
+    suspicious_accounts: Set[str],
+    account_to_ring: Dict[str, str],
+    risk_scores: Dict[str, int],
+    account_patterns: Dict[str, List[str]],
+    max_nodes: int = 1000
+) -> Dict[str, Any]:
+    """
+    Extract a relevant neighborhood subgraph centered around suspicious nodes.
+    Capped at max_nodes to prevent rendering freeze on frontend.
+    """
+    suspicious_list = list(suspicious_accounts)
+    
+    visual_nodes = set(suspicious_list[:min(len(suspicious_list), max_nodes)])
+    
+    if len(visual_nodes) < max_nodes:
+        for node in suspicious_list:
+            if len(visual_nodes) >= max_nodes:
+                break
+            for neighbor in list(G.successors(node)) + list(G.predecessors(node)):
+                visual_nodes.add(neighbor)
+                if len(visual_nodes) >= max_nodes:
+                    break
+                    
+    subG = G.subgraph(visual_nodes)
+    
+    nodes = []
+    edges = []
+    
+    for node in subG.nodes():
+        node_type = "normal"
+        if node in suspicious_accounts:
+            patterns = account_patterns.get(node, [])
+            if any("cycle" in p or "layered" in p for p in patterns):
+                node_type = "ring"
+            else:
+                node_type = "mule"
+                
+        total_volume = 0
+        for u, v, data in subG.in_edges(node, data=True):
+            total_volume += data.get('amount', 0)
+        for u, v, data in subG.out_edges(node, data=True):
+            total_volume += data.get('amount', 0)
+            
+        nodes.append({
+            "id": node,
+            "name": node,
+            "type": node_type,
+            "riskScore": risk_scores.get(node, 0),
+            "flaggedPatterns": account_patterns.get(node, []),
+            "totalVolume": total_volume,
+            "linkedAccounts": safe_degree(subG, node)
+        })
+        
+    for u, v, data in subG.edges(data=True):
+        ring_u = account_to_ring.get(u)
+        ring_v = account_to_ring.get(v)
+        is_ring_connection = False
+        if ring_u and ring_v and ring_u == ring_v and ring_u != "UNASSIGNED":
+            is_ring_connection = True
+            
+        edges.append({
+            "source": u,
+            "target": v,
+            "value": data.get('amount', 0),
+            "isRingConnection": is_ring_connection
+        })
+        
+    return {
+        "nodes": nodes,
+        "links": edges
     }

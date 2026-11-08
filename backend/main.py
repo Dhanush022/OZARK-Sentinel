@@ -6,11 +6,13 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from graph_analyzer import analyze_transactions
+from graph_analyzer import analyze_transactions, analyze_large_local_csv
+from scalable_analyzer import analyze_transactions_scalable
 from typing import Optional
 import networkx as nx
 import os
 import secrets
+import tempfile
 from dotenv import load_dotenv
 from algosdk.v2client import algod
 from algosdk.kmd import KMDClient
@@ -29,14 +31,14 @@ try:
     # Connect to local IPFS node (default: http://127.0.0.1:5001)
     try:
         ipfs_client = ipfshttpclient.connect('/ip4/127.0.0.1/tcp/5001')
-        print("✅ Connected to IPFS node")
+        print("[IPFS] Connected to IPFS node")
     except Exception as e:
-        print(f"⚠️ IPFS node not available: {e}")
+        print(f"[IPFS] IPFS node not available: {e}")
         print("   Run: ipfs daemon")
         ipfs_client = None
         IPFS_AVAILABLE = False
 except ImportError:
-    print("⚠️ IPFS client not installed. Run: pip install ipfshttpclient")
+    print("[IPFS] IPFS client not installed. Run: pip install ipfshttpclient")
     ipfs_client = None
     IPFS_AVAILABLE = False
 
@@ -168,8 +170,27 @@ class FlagRequest(BaseModel):
     ipfs_hash: Optional[str] = None
 
 
+class LocalDetectRequest(BaseModel):
+    """Request model for local large CSV file analysis"""
+    file_path: str
+    sample_limit: Optional[int] = 100000
+    downsample_rate: Optional[float] = 0.001
+    only_laundering: Optional[bool] = True
+
+
 # Global variable to store PAN mapping IPFS CID (permanent, stored in IPFS)
 pan_mapping_ipfs_cid = "QmdSjyrrBLvdH4Gjda1wMrk9sGrLowGBEbP5VnxuNZkydN"
+
+
+def risk_score_to_chain(value) -> int:
+    """Normalize a 0.00-1.00 or 0-100 risk score to the contract's 0-100 scale."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if score <= 1.0:
+        score *= 100
+    return max(0, min(100, int(round(score))))
 
 
 @app.get("/")
@@ -196,6 +217,7 @@ async def health_check():
 
 
 @app.post("/analyze")
+@app.post("/detect")
 async def analyze_csv(file: UploadFile = File(...)):
     """
     Analyze uploaded transaction CSV for money mule patterns
@@ -210,9 +232,16 @@ async def analyze_csv(file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
     
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, f"aml_upload_{int(time.time())}_{secrets.token_hex(4)}.csv")
+    
     try:
-        contents = await file.read()
-        results, graph = analyze_transactions(contents)
+        # Stream upload to temporary disk file to handle multi-GB datasets without loading into RAM
+        with open(temp_file_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                buffer.write(chunk)
+                
+        results, graph = analyze_transactions_scalable(temp_file_path)
         
         # Save to global variables
         last_analysis_result = results
@@ -234,12 +263,20 @@ async def analyze_csv(file: UploadFile = File(...)):
         
         # Save to JSON file
         output_path = Path("output.json")
+        from fastapi.encoders import jsonable_encoder
+        json_compatible_results = jsonable_encoder(results)
         with open(output_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(json_compatible_results, f, indent=2)
         
-        return results
+        return json_compatible_results
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    finally:
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 
 @app.post("/hash")
@@ -367,7 +404,7 @@ async def upload_pan_mapping(file: UploadFile = File(...)):
         # Store CID globally for later use
         pan_mapping_ipfs_cid = ipfs_cid
         
-        print(f"✅ Uploaded PAN mapping to IPFS: {ipfs_cid}")
+        print(f"[IPFS] Uploaded PAN mapping to IPFS: {ipfs_cid}")
         
         return {
             "status": "success",
@@ -610,9 +647,9 @@ async def bulk_flag_suspicious():
             # Upload to IPFS
             result = ipfs_client.add_json(ipfs_data)
             ipfs_hash = result  # This is the CID
-            print(f"✅ Uploaded mule data to IPFS: {ipfs_hash}")
+            print(f"[IPFS] Uploaded mule data to IPFS: {ipfs_hash}")
         except Exception as e:
-            print(f"⚠️  IPFS upload failed: {e}")
+            print(f"[IPFS] IPFS upload failed: {e}")
             # Continue without IPFS (blockchain flag only)
     
     flagged = []
@@ -913,9 +950,16 @@ async def detect_mules(file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
     
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, f"aml_upload_{int(time.time())}_{secrets.token_hex(4)}.csv")
+    
     try:
-        contents = await file.read()
-        results, graph = analyze_transactions(contents)
+        # Stream upload to temporary disk file to handle multi-GB datasets without loading into RAM
+        with open(temp_file_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                buffer.write(chunk)
+                
+        results, graph = analyze_large_local_csv(temp_file_path)
         
         # Save to global variables
         last_analysis_result = results
@@ -923,16 +967,28 @@ async def detect_mules(file: UploadFile = File(...)):
         
         suspicious_accounts = results.get("suspicious_accounts", [])
         
-        # Transform data for frontend - match MuleNode interface
+        # Transform data for frontend - match MuleNode interface with continuous risk score (0.00-1.00)
         mules = []
         for acc in suspicious_accounts:
+            score = float(acc.get("risk_score", acc.get("suspicion_score", 0)))
+            r_level = acc.get("risk_level", "HIGH" if score >= 0.70 else "MEDIUM" if score >= 0.30 else "LOW")
+            node_t = "mule" if r_level == "HIGH" else "shell" if r_level == "MEDIUM" else "normal"
+            
             mules.append({
                 "id": acc.get("account_id"),
-                "name": acc.get("account_id"),  # Use account_id as name
-                "riskScore": acc.get("suspicion_score", 0),
-                "type": "mule",
+                "name": acc.get("account_id"),
+                "riskScore": score,
+                "riskLevel": r_level,
+                "type": node_t,
                 "flaggedPatterns": acc.get("detected_patterns", []),
-                "linkedAccounts": acc.get("flagged_connections", 0)
+                "reasons": acc.get("reasons", []),
+                "inAmount": acc.get("in_amount", 0.0),
+                "outAmount": acc.get("out_amount", 0.0),
+                "passThroughRatio": acc.get("pass_through_ratio", 0.0),
+                "uniqueSenders": acc.get("unique_senders", 0),
+                "uniqueReceivers": acc.get("unique_receivers", 0),
+                "txCount": acc.get("tx_count", 0),
+                "linkedAccounts": acc.get("unique_senders", 0) + acc.get("unique_receivers", 0)
             })
         
         # Build graph data for frontend - ONE UNIFIED GRAPH
@@ -944,28 +1000,35 @@ async def detect_mules(file: UploadFile = File(...)):
         ring_accounts = set()
         for ring in fraud_rings:
             ring_accounts.update(ring.get("accounts", []))
+            
+        acc_dict = {a.get("account_id"): a for a in suspicious_accounts}
         
         # Add ALL nodes from the transaction graph
         for node in graph.nodes():
-            is_mule = any(acc.get("account_id") == node for acc in suspicious_accounts)
+            acc_info = acc_dict.get(node, {})
+            score = float(acc_info.get("risk_score", acc_info.get("suspicion_score", 0.0)))
             is_in_ring = node in ring_accounts
-            risk_score = next((acc.get("suspicion_score", 0) for acc in suspicious_accounts if acc.get("account_id") == node), 0)
-            patterns = next((acc.get("detected_patterns", []) for acc in suspicious_accounts if acc.get("account_id") == node), [])
+            patterns = acc_info.get("detected_patterns", [])
+            r_level = acc_info.get("risk_level", "HIGH" if score >= 0.70 else "MEDIUM" if score >= 0.30 else "LOW")
             
-            # Determine node type based on patterns
-            node_type = "normal"
-            if is_mule:
-                if is_in_ring:
-                    node_type = "ring"  # Part of fraud ring
-                else:
-                    node_type = "mule"  # General mule
+            # Determine node type
+            if is_in_ring:
+                node_type = "ring"
+            elif score >= 0.70:
+                node_type = "mule"
+            elif score >= 0.30:
+                node_type = "shell"
+            else:
+                node_type = "normal"
             
             graph_nodes.append({
                 "id": node,
                 "name": node,
-                "riskScore": risk_score if is_mule else 0,
+                "riskScore": score,
+                "riskLevel": r_level,
                 "type": node_type,
-                "flaggedPatterns": patterns if is_mule else [],
+                "flaggedPatterns": patterns,
+                "reasons": acc_info.get("reasons", []),
                 "inFraudRing": is_in_ring
             })
         
@@ -995,7 +1058,7 @@ async def detect_mules(file: UploadFile = File(...)):
             },
             "summary": {
                 "totalTransactions": results.get("summary", {}).get("total_transactions", 0),
-                "flaggedAccounts": len(mules),
+                "flaggedAccounts": results.get("summary", {}).get("suspicious_accounts_flagged", len(mules)),
                 "averageRiskScore": round(avg_risk, 1),
                 "detectedCycles": detected_cycles
             },
@@ -1015,12 +1078,12 @@ async def detect_mules(file: UploadFile = File(...)):
         # AUTO-FLAG: Register each detected mule as Soul Bound Token on blockchain
         blockchain_results = []
         if contract and sender_sk and mules:
-            print(f"\n🔗 Auto-flagging {len(mules)} mules to Algorand blockchain...")
+            print(f"\n[BLOCKCHAIN] Auto-flagging {len(mules)} mules to Algorand blockchain...")
             for mule in mules:
                 try:
                     account_id = mule["id"]
                     hashed_id_bytes = hashlib.sha256(account_id.encode()).digest()
-                    risk_score = int(mule["riskScore"])
+                    risk_score = risk_score_to_chain(mule["riskScore"])
                     
                     atc = AtomicTransactionComposer()
                     method: Method = contract.get_method_by_name("register_wallet")
@@ -1057,15 +1120,15 @@ async def detect_mules(file: UploadFile = File(...)):
                         "txid": txid,
                         "status": "flagged"
                     })
-                    print(f"  ✅ {account_id} flagged on-chain (txid: {txid[:12]}...)")
+                    print(f"  [+] {account_id} flagged on-chain (txid: {txid[:12]}...)")
                 except Exception as e:
-                    print(f"  ⚠️ Failed to flag {mule['id']}: {str(e)}")
+                    print(f"  [-] Failed to flag {mule['id']}: {str(e)}")
                     blockchain_results.append({
                         "account": mule["id"],
                         "status": "failed",
                         "error": str(e)
                     })
-            print(f"🔗 Blockchain flagging complete: {len([b for b in blockchain_results if b['status'] == 'flagged'])}/{len(mules)} succeeded\n")
+            print(f"[BLOCKCHAIN] Blockchain flagging complete: {len([b for b in blockchain_results if b['status'] == 'flagged'])}/{len(mules)} succeeded\n")
         
         # Add blockchain results to response
         response_data["blockchainFlags"] = blockchain_results
@@ -1075,6 +1138,182 @@ async def detect_mules(file: UploadFile = File(...)):
         import traceback
         print(f"Detection failed: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    finally:
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+
+
+@app.post("/detect-local")
+async def detect_mules_local(request: LocalDetectRequest):
+    """
+    Local file-path-based money mule detection for massive datasets (e.g. multi-gigabyte files).
+    Processes the CSV directly from disk in chunks, downsamples normal traffic, and
+    extracts a capped visualization graph to keep the UI interactive.
+    """
+    global last_analysis_result, last_graph
+    
+    try:
+        # Call the large file analysis function
+        results, graph = analyze_large_local_csv(
+            file_path=request.file_path,
+            sample_limit=request.sample_limit,
+            downsample_rate=request.downsample_rate,
+            only_laundering=request.only_laundering
+        )
+        
+        # Save to global variables
+        last_analysis_result = results
+        last_graph = graph
+        
+        suspicious_accounts = results.get("suspicious_accounts", [])
+        
+        # Transform data for frontend - match MuleNode interface
+        mules = []
+        for acc in suspicious_accounts:
+            mules.append({
+                "id": acc.get("account_id"),
+                "name": acc.get("account_id"),
+                "riskScore": acc.get("suspicion_score", 0),
+                "type": "mule",
+                "flaggedPatterns": acc.get("detected_patterns", []),
+                "linkedAccounts": acc.get("flagged_connections", 0)
+            })
+        
+        # Build graph data for frontend from the capped visualization graph
+        graph_nodes = []
+        graph_links = []
+        
+        capped_graph = results.get("graph", {"nodes": [], "links": []})
+        fraud_rings = results.get("fraud_rings", [])
+        ring_accounts = set()
+        for ring in fraud_rings:
+            ring_accounts.update(ring.get("accounts", []))
+            
+        for n in capped_graph.get("nodes", []):
+            node_id = n.get("id")
+            is_mule = any(acc.get("account_id") == node_id for acc in suspicious_accounts)
+            is_in_ring = node_id in ring_accounts
+            
+            node_type = "normal"
+            if is_mule:
+                if is_in_ring:
+                    node_type = "ring"
+                else:
+                    node_type = "mule"
+                    
+            graph_nodes.append({
+                "id": node_id,
+                "name": node_id,
+                "riskScore": n.get("riskScore", 0),
+                "type": node_type,
+                "flaggedPatterns": n.get("flaggedPatterns", []),
+                "inFraudRing": is_in_ring
+            })
+            
+        for l in capped_graph.get("links", []):
+            source = l.get("source")
+            target = l.get("target")
+            is_ring_connection = l.get("isRingConnection", False)
+            
+            graph_links.append({
+                "source": source,
+                "target": target,
+                "isRingConnection": is_ring_connection
+            })
+        
+        # Calculate average risk score
+        avg_risk = sum(m["riskScore"] for m in mules) / len(mules) if mules else 0
+        detected_cycles = len(fraud_rings)
+        
+        response_data = {
+            "mules": mules,
+            "graph": {
+                "nodes": graph_nodes,
+                "links": graph_links
+            },
+            "summary": {
+                "totalTransactions": results.get("summary", {}).get("total_transactions", 0),
+                "flaggedAccounts": results.get("summary", {}).get("suspicious_accounts_flagged", len(mules)),
+                "averageRiskScore": round(avg_risk, 1),
+                "detectedCycles": detected_cycles
+            },
+            "detailedAnalysis": {
+                "suspicious_accounts": results.get("suspicious_accounts", []),
+                "fraud_rings": results.get("fraud_rings", []),
+                "analysis_summary": results.get("summary", {}),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ipfs_integration": {
+                    "pan_mapping_cid": pan_mapping_ipfs_cid,
+                    "status": "active" if IPFS_AVAILABLE else "unavailable"
+                }
+            }
+        }
+        
+        # AUTO-FLAG: Register each detected mule on the Algorand blockchain
+        blockchain_results = []
+        if contract and sender_sk and mules:
+            print(f"\n[BLOCKCHAIN] Auto-flagging {len(mules)} mules to Algorand blockchain...")
+            for mule in mules:
+                try:
+                    account_id = mule["id"]
+                    hashed_id_bytes = hashlib.sha256(account_id.encode()).digest()
+                    risk_score = risk_score_to_chain(mule["riskScore"])
+                    
+                    atc = AtomicTransactionComposer()
+                    method: Method = contract.get_method_by_name("register_wallet")
+                    signer = AccountTransactionSigner(sender_sk)
+                    
+                    sp = algod_client.suggested_params()
+                    ipfs_hash = pan_mapping_ipfs_cid if pan_mapping_ipfs_cid else ""
+                    profile_box_size = 48
+                    ipfs_box_size = 32 + len(ipfs_hash)
+                    sp.fee = 1000 + (2500 + 400 * profile_box_size) + (2500 + 400 * ipfs_box_size)
+                    sp.flat_fee = True
+                    
+                    ipfs_key_bytes = hashed_id_bytes + b"_ipfs"
+                    
+                    atc.add_method_call(
+                        app_id=APP_ID,
+                        method=method,
+                        sender=sender_addr,
+                        sp=sp,
+                        signer=signer,
+                        method_args=[
+                            hashed_id_bytes,
+                            risk_score,
+                            1,
+                            mule.get("linkedAccounts", 0),
+                            ipfs_hash
+                        ],
+                        boxes=[(APP_ID, hashed_id_bytes), (APP_ID, ipfs_key_bytes)]
+                    )
+                    result = atc.execute(algod_client, 2)
+                    txid = result.tx_ids[0]
+                    blockchain_results.append({
+                        "account": account_id,
+                        "txid": txid,
+                        "status": "flagged"
+                    })
+                    print(f"  [+] {account_id} flagged on-chain (txid: {txid[:12]}...)")
+                except Exception as e:
+                    print(f"  [-] Failed to flag {mule['id']}: {str(e)}")
+                    blockchain_results.append({
+                        "account": mule["id"],
+                        "status": "failed",
+                        "error": str(e)
+                    })
+            print(f"[BLOCKCHAIN] Blockchain flagging complete: {len([b for b in blockchain_results if b['status'] == 'flagged'])}/{len(mules)} succeeded\n")
+            
+        response_data["blockchainFlags"] = blockchain_results
+        
+        return response_data
+    except Exception as e:
+        import traceback
+        print(f"Detection failed: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Local analysis failed: {str(e)}")
 
 
 @app.post("/verify-pan")
@@ -1145,7 +1384,7 @@ async def verify_pan(request: dict):
             if acc.get("account_id") == sender_id:
                 response["soulBound"] = True
                 response["canCreateAccount"] = False
-                response["riskScore"] = acc.get("suspicion_score", 100)
+                response["riskScore"] = risk_score_to_chain(acc.get("suspicion_score", 1.0))
                 response["detected_patterns"] = acc.get("detected_patterns", [])
                 response["message"] = "⚠️ PAN BLACKLISTED - Associated with flagged mule account"
                 break
